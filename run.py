@@ -14,7 +14,6 @@ from __future__ import annotations
 import argparse
 import json
 import queue
-import struct
 import threading
 import time
 from collections import deque

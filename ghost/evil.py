@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import struct
 
-from .core import MON_SIZE, ROM_BASE, decode_mon, encode_text
+from .core import MON_SIZE, decode_mon, encode_text
 from .perception import OBJECT_EVENTS_ADDR, OE_SIZE, object_events, _graphics_names
 from .world import World
 

@@ -5,7 +5,6 @@ Everything is addressed by the names in pret/pokefirered's pokefirered.sym (exac
 """
 from __future__ import annotations
 
-import gzip
 import hashlib
 import os
 import re
