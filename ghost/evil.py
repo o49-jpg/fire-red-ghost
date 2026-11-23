@@ -30,6 +30,8 @@ TRAINERS_ADDR, TRAINER_SIZE = 0x0823EAC8, 0x28
 WILD_HEADERS_ADDR, WILD_HEADER_SIZE, WILD_HEADER_COUNT = 0x083C9CB8, 0x14, 133
 # GBA function pointers to Thumb code carry the low bit (CB2_Overworld reads back as ...b5, not ...b4).
 WARP_DEST_ADDR, MAIN_CALLBACK2_OFF, CB2_LOAD_MAP = 0x02031DBC, 0x04, 0x0805671C | 1
+SB1_LOCATION = 0x04        # include/global.fieldmap.h:392 struct WarpData {s8 group, num, warpId; s16 x, y}
+WARP_DATA = "<bbb1xhh"     # sizeof 8: warpId at +2, one pad byte, then s16 x,y at +4/+6
 
 # event script opcodes (asm/macros/event.inc)
 OP_LOADWORD, OP_CALLSTD, OP_END, OP_TRAINERBATTLE = 0x0F, 0x09, 0x02, 0x5C
@@ -253,6 +255,64 @@ def wild_encounter(world: World, species, level: int = 5) -> str:
             f"at L{lv} (rate {rate}); table repointed to {base:#x}")
 
 
+def resolve_map(world: World, map_ref) -> tuple[int, int] | None:
+    want = str(map_ref).strip().lower().replace(" ", "_")
+    if "." in want and all(p.isdigit() for p in want.split(".")[:2]):
+        grp, num = (int(v) for v in want.split(".", 1)[:2])
+        return grp, num
+    alias = {"mom": "PalletTown_PlayersHouse_1F", "home": "PalletTown_PlayersHouse_1F",
+             "bedroom": "PalletTown_PlayersHouse_2F", "lab": "PalletTown_ProfessorOaksLab",
+             "oak": "PalletTown_ProfessorOaksLab", "pallet": "PalletTown", "viridian": "ViridianCity",
+             "pewter": "PewterCity", "cerulean": "CeruleanCity", "vermilion": "VermilionCity",
+             "lavender": "LavenderTown", "celadon": "CeladonCity", "fuchsia": "FuchsiaCity",
+             "saffron": "SaffronCity", "cinnabar": "CinnabarIsland", "indigo": "IndigoPlateau"}
+    want = alias.get(want, want)
+    for gi, group in enumerate(world.map_groups):
+        for ni, name in enumerate(group):
+            low = name.lower()
+            if low == want or low.endswith("_" + want) or low.replace("_", "") == want.replace("_", ""):
+                return gi, ni
+    return None
+
+
+def phase(world: World, map_ref, x: int = -1, y: int = -1) -> str:
+    """Engine-clean map change: stage the destination in SaveBlock1->location and ask the overworld to
+    load a fresh map (CB2_LoadMap). Same path a real warp takes, so music, tilesets and object events all
+    arrive correctly - no half-loaded world, no glitched state.
+
+    CB2_LoadMap -> LoadMapFromWarp never calls SetPlayerCoordsFromWarp (only WarpIntoMap does, for
+    Teleport/Escape Rope), so the player keeps his old pos: write pos by hand, on a walkable tile."""
+    hit = resolve_map(world, map_ref)
+    if hit is None:
+        return f"no map named {map_ref!r}"
+    grp, num = hit
+    if x < 0 or y < 0:                      # no coords: read the map out of the ROM and land somewhere legal
+        from . import nav
+        landing = nav.landing_tile_rom(world, bytes(world.g.rom), (grp, num))
+        x, y = landing if landing else (0, 0)
+    x, y = int(x), int(y)
+    data = struct.pack(WARP_DATA, grp, num, -1, x, y)
+    world.g.write(world.sb1() + SB1_LOCATION, data)
+    world.g.write(world.sb1() + 0x00, struct.pack("<hh", x, y))   # struct Coords16 pos @ SaveBlock1+0
+    world.g.write(WARP_DEST_ADDR, data)
+    world.g.write(world.g.sym("gMain").addr + MAIN_CALLBACK2_OFF, struct.pack("<I", CB2_LOAD_MAP))
+    return f"warping to {world.map_groups[grp][num]}" + (f" at ({x},{y})" if x >= 0 and y >= 0 else "")
+
+
+def nearby_maps(world: World, map_ref) -> list[str]:
+    """Same-map-name siblings in other groups - a cheap way to answer 'where can I go that's like here'."""
+    hit = resolve_map(world, map_ref)
+    if hit is None:
+        return []
+    name = world.map_groups[hit[0]][hit[1]].lower()
+    out = []
+    for gi, group in enumerate(world.map_groups):
+        for ni, cand in enumerate(group):
+            if cand.lower() != name and (name in cand.lower() or cand.lower() in name):
+                out.append(cand)
+    return out[:12]
+
+
 def warp(world: World, map_ref, x: int = 0, y: int = 0) -> str:
     g = world.g
     want = str(map_ref).strip().lower()
@@ -269,11 +329,10 @@ def warp(world: World, map_ref, x: int = 0, y: int = 0) -> str:
                 break
     if grp is None:
         return f"no map named {map_ref!r}"
-    px, py = max(0, min(255, int(x))), max(0, min(255, int(y)))
-    data = struct.pack("<bbb1xhh", grp, num, -1, px, py)
+    px, py = max(0, min(32767, int(x))), max(0, min(32767, int(y)))
+    data = struct.pack(WARP_DATA, grp, num, -1, px, py)
     sb1 = world.sb1()
     g.write(WARP_DEST_ADDR, data)              # what the script path stages
-    g.write(sb1 + 0x04, data)                  # ApplyCurrentWarp: what CB2_LoadMap actually reads
-    g.write(sb1 + 0x00, struct.pack("<HH", px, py))
+    g.write(sb1 + SB1_LOCATION, data)          # ApplyCurrentWarp: what CB2_LoadMap actually reads
     g.write(g.sym("gMain").addr + MAIN_CALLBACK2_OFF, struct.pack("<I", CB2_LOAD_MAP))
     return f"phasing to {world.map_groups[grp][num]} at ({px},{py})"

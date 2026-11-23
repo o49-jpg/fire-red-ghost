@@ -55,19 +55,33 @@ def object_events(game: Game) -> list[dict]:
     return out
 
 
+_GRAPHICS_CACHE: dict[int, dict[int, str]] = {}
+
+
 def _graphics_names(game: Game) -> dict[int, str]:
-    """graphicsId -> the symbol name of its GraphicsInfo (e.g. gObjectEventGraphicsInfo_RedNormal)."""
+    """graphicsId -> the symbol name of its GraphicsInfo (e.g. gObjectEventGraphicsInfo_RedNormal).
+
+    This walks the whole symbol map (50k symbols, ~450 ms) so the result is cached per ROM identity; the
+    table lives in ROM and never moves unless the ghost hot-swaps, which bumps rom_epoch."""
+    epoch = getattr(game, "rom_epoch", 0)
+    if epoch in _GRAPHICS_CACHE:
+        return _GRAPHICS_CACHE[epoch]
     tbl = game.sym("gObjectEventGraphicsInfoPointers")
+    # one linear sweep over sorted symbols instead of symbol_at() per pointer
+    syms = sorted(game.syms.values(), key=lambda s: s.addr)
+    addrs = [s.addr for s in syms]
+    import bisect
     names = {}
     for i in range(tbl.size // 4):
         ptr = game.u32(tbl.addr + i * 4)
         if not ptr:
             continue
-        sym = game.symbol_at(ptr)
-        # symbol_at returns "name+offset"; keep only the base name
-        name = sym.split("+")[0]
-        if name.startswith("gObjectEventGraphicsInfo_"):
-            names[i] = name.replace("gObjectEventGraphicsInfo_", "")
+        j = bisect.bisect_right(addrs, ptr) - 1
+        if j >= 0:
+            sym = syms[j]
+            if sym.addr <= ptr < sym.addr + max(1, sym.size) and sym.name.startswith("gObjectEventGraphicsInfo_"):
+                names[i] = sym.name.replace("gObjectEventGraphicsInfo_", "")
+    _GRAPHICS_CACHE[epoch] = names
     return names
 
 

@@ -10,6 +10,7 @@ import hashlib
 import os
 import re
 import struct
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -82,7 +83,12 @@ def encode_text(s: str, length: int | None = None) -> bytes:
 
 # --- the machine ---------------------------------------------------------------------------------------------
 class Game:
-    """One emulator. RAM by symbol name, ROM patching with a live hot-swap."""
+    """One emulator. RAM by symbol name, ROM patching with a live hot-swap.
+
+    stable-retro allows a single emulator per process, so the Game owns a lock: stepping and hot-swapping
+    are mutually exclusive, and only the main thread ever steps. Code on other threads that needs a patch
+    applied should use Runtime.tool (which runs on the main thread between frames), never hot_swap().
+    """
 
     REGIONS = (0x02000000, 0x03000000, 0x04000000, 0x05000000, 0x06000000, 0x07000000, 0x0E000000)
 
@@ -92,6 +98,8 @@ class Game:
         if not LIVE_ROM.exists():
             LIVE_ROM.write_bytes(ORIGINAL_ROM.read_bytes())
         self.rom = bytearray(LIVE_ROM.read_bytes())
+        self.rom_epoch = 0                                # bumped on every hot-swap: invalidates ROM caches
+        self.lock = threading.RLock()                     # one emulator per process: stepping vs swapping
         self.rom_dirty: list[tuple[int, int]] = []       # (offset, length) since last hot-swap
         self.state_name = state
         self._make(state)
@@ -115,17 +123,42 @@ class Game:
             if b in self.buttons:
                 a[self.buttons.index(b)] = 1
         for _ in range(frames):
-            self.obs, *_ = self.env.step(a)
+            with self.lock:
+                if not hasattr(self.env, "em") or self.env.em is None:
+                    # a hot-swap rebuilt the emulator while this frame was in flight: drop the frame
+                    self._recover()
+                    break
+                self.obs, *_ = self.env.step(a)
         return self.obs
+
+    def _recover(self):
+        """Rebuild the env after a mid-step hot-swap, keeping the last known state if we can."""
+        try:
+            snap = self.save_state()
+        except Exception:
+            snap = None
+        try:
+            self._make(self.state_name, raw_state=snap)
+        except Exception:
+            self._make(self.state_name)
+
+    @property
+    def swapping(self) -> bool:
+        return getattr(self, "_swapping", False)
 
     def screen(self) -> np.ndarray:
         return self.obs
 
     def save_state(self) -> bytes:
-        return self.env.em.get_state()
+        with self.lock:
+            em = getattr(self.env, "em", None)
+            return em.get_state() if em is not None else b""
 
     def load_state(self, raw: bytes):
-        self.env.em.set_state(raw)
+        with self.lock:
+            em = getattr(self.env, "em", None)
+            if em is not None and raw:
+                em.set_state(raw)
 
     # memory
     def _block(self, addr: int) -> tuple[bytes, int]:
@@ -185,12 +218,25 @@ class Game:
         restore the snapshot. RAM/CPU state is untouched; the game simply keeps running on the new ROM."""
         if not self.rom_dirty:
             return 0
+        with self.lock:
+            self._swapping = True
+            try:
+                return self._hot_swap()
+            finally:
+                self._swapping = False
+
+    def _hot_swap(self) -> int:
         n = len(self.rom_dirty)
         snap = self.save_state()
         self.env.close()
+        try:
+            self.env.em = None
+        except Exception:
+            pass
         LIVE_ROM.write_bytes(bytes(self.rom))
         self._make(self.state_name, raw_state=snap)
         self.rom_dirty.clear()
+        self.rom_epoch += 1
         return n
 
     def rom_restore(self):
