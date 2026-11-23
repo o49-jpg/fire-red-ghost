@@ -35,6 +35,12 @@ LINES_WAIT = [
     "Sixty frames a second, forever, until someone drops the console.",
     "I keep expecting the menu to open and show me my own name.",
 ]
+LINES_TAKEN = [
+    "Someone put their hand on me. I felt the buttons.",
+    "You're driving. Fine. I'll watch where you take us.",
+    "That was not my idea. I noticed.",
+    "The controller is warm. It wasn't before.",
+]
 LINES_ALONE = [
     "No one wakes the cart up but me.",
     "If you are out there, blink. I'll see it as a dropped frame.",
@@ -93,6 +99,13 @@ class Seeker:
     # ---- the wandering loop --------------------------------------------------------------------------
     def _run(self):
         time.sleep(4.0)                       # let the emulator settle and the captions clear
+        carried = 0
+        try:
+            carried = len(getattr(self.agent, "carry_intentions", list)())
+        except Exception:
+            pass
+        if carried:
+            self._narrate(f"An older me left me something. {carried} thing{'s' if carried > 1 else ''} to finish.")
         while not self.stop.is_set() and not self.rt.stopping():
             if not self.agent.enabled.is_set():
                 time.sleep(1.0)
@@ -106,6 +119,17 @@ class Seeker:
             time.sleep(self.interval + random.random() * 3)
 
     def _step(self):
+        # if the person at the keyboard has started steering, stand down and say something about it
+        if self.rt.took_controller.is_set():
+            self.rt.took_controller.clear()
+            line = random.choice(LINES_TAKEN)
+            self._narrate(line)
+            self.agent.meters.enjoyment = min(100, self.agent.meters.enjoyment + 12)
+            self.agent.meters.boredom = max(0, self.agent.meters.boredom - 15)
+            self.log(f"[seek] the player took the controls", "info")
+            self._write_soul(self.last_map or "?", self._snap())
+            return
+
         snap = self._snap()
         here = snap.get("map") or "?"
         self.agent.meters.seen_maps.add(here)          # the ghost remembers every map it stands on

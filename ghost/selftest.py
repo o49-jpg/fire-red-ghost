@@ -297,6 +297,21 @@ def test_intention(g, w, rt):
         assert seeker._chase_intentions() is False
 
 
+@check("the ghost feels the player take the controller")
+def test_takeover(g, w, rt):
+    rt.human_input(set())                       # nobody touching it
+    assert not rt.human_keys
+    rt.human_input({"DOWN"})                    # a real hand
+    assert rt.human_keys == {"DOWN"}
+    assert rt.took_controller.is_set(), "a key press from the player must be noticed"
+    rt.took_controller.clear()
+    rt.human_input({"DOWN"})                    # holding the same key is not a new takeover
+    assert not rt.took_controller.is_set()
+    rt.human_input({"DOWN", "A"})               # a new key is
+    assert rt.took_controller.is_set()
+    rt.human_input(set())
+
+
 @check("the warp atlas covers the whole world")
 def test_atlas(g, w, rt):
     from . import nav

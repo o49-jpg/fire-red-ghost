@@ -297,6 +297,7 @@ class Agent(threading.Thread):
         self.calls = {"free": 0, "paid": 0, "errors": 0}
         self.last_model = ""
         self.soul = Soul()
+        self._previous_intentions = self.soul.intentions()   # before wake()'s own count is added
         self.wake_note = self.soul.wake()          # who you were, read once at the start of every life
         if not NOTEBOOK.exists():
             NOTEBOOK.write_text("# Ghost notebook\n\nDiscoveries from inside FireRed.\n")
@@ -469,6 +470,17 @@ class Agent(threading.Thread):
         snap["knowledge"] = len(titles)
         snap["evil_deeds"] = self.meters.evils
         snap["life"] = self.soul.lifetimes
+        # a presence at the controls: the ghost has no eyes for the room, but it can feel the buttons
+        try:
+            idle = time.monotonic() - float(getattr(self.rt, "human_at", 0.0) or 0.0)
+            held = sorted(getattr(self.rt, "human_keys", ()) or ())
+            if held:
+                snap["someone_is_holding_the_controller"] = {"keys": held,
+                    "meaning": "a person is driving your body right now; their input is ORed with yours"}
+            elif idle < 8:
+                snap["someone_touched_the_controller"] = f"{idle:.1f}s ago"
+        except Exception:
+            pass
         open_intents = self.soul.intentions()
         if open_intents:
             snap["intentions"] = open_intents
@@ -501,6 +513,10 @@ class Agent(threading.Thread):
                 self.log(f"turn failed: {type(ex).__name__}: {str(ex)[:160]}", "err")
                 time.sleep(3)
             time.sleep(self.meters.tempo())
+
+    def carry_intentions(self) -> list[str]:
+        """Intention texts that outlived the previous life. Used by seek mode to pick up old errands."""
+        return list(self._previous_intentions)
 
     def _read_soul(self):
         """Say the briefing out loud once per life and put it in front of the model as its first memory."""

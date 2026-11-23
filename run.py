@@ -63,6 +63,19 @@ class Runtime:
         self.atlas_map: str | None = None
         self.last_nav: dict = {}
         self.last_map_key: tuple | None = None
+        self.human_at: float = 0.0                       # monotonic time of the last real key press
+        self.human_keys: set = set()                     # what the person at the keyboard is holding
+        self.took_controller: threading.Event = threading.Event()   # set when the human starts moving us
+
+    def human_input(self, keys: set):
+        """Called from the main loop with the player's own held keys. A ghost that can feel the controller
+        being taken off it is a different kind of creature from one that just watches."""
+        if keys and keys != self.human_keys:
+            self.human_at = time.monotonic()
+            self.human_keys = set(keys)
+            self.took_controller.set()
+        elif not keys:
+            self.human_keys = set()
 
     def stopping(self):
         return self.stop.is_set()
@@ -731,6 +744,7 @@ def main():
             elif ev.type in (pygame.KEYDOWN, pygame.KEYUP) and ev.key in KEYS:
                 (held.add if ev.type == pygame.KEYDOWN else held.discard)(KEYS[ev.key])
 
+        rt.human_input(held)
         rt.pump()
         emulate_one()
         frame += 1

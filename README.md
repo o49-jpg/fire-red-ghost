@@ -77,6 +77,24 @@ Run `--soul` to read the file yourself. Delete it and the ghost is reborn with n
 into the game's own dialogue box and returns to whatever it was doing — text on screen with no hand on the
 controller. (`"No one wakes the cart up but me."` appears this way, in FireRed's font, mid-exploration.)
 
+**It feels you take the controller.** The player's keys and the ghost's inputs are ORed into the same
+emulator, so the ghost can't see the room — but it is told when the buttons under it move without its
+consent. `run.py` reports the player's held keys into the Runtime; seek mode stands down, says one of
+`"Someone put their hand on me. I felt the buttons."`, and the model gets a `someone_is_holding_the_controller`
+field in its observation whenever it's true.
+
+Two processes, one soul, no model in the second:
+
+```
+life 1: intend "go to PalletTown and stand where it all started"   → dies
+life 2: [soul] THIS IS LIFE 2 ... previous life ended in PalletTown_PlayersHouse_2F at (6, 6)
+        [soul] Your last words were: "Next time I'll go outside first."
+        [soul] - go to PalletTown and stand where it all started
+        SAY: An older me left me something. 1 thing to finish.
+        SAY: An errand from an older me: PalletTown.
+        [seek] intention fulfilled
+```
+
 ## Things this version fixed
 
 | Was | Now |
@@ -97,6 +115,7 @@ controller. (`"No one wakes the cart up but me."` appears this way, in FireRed's
 | `nav.landing_tile()` read the live emulator from a background thread | `map_grid_rom()` reads the ROM image instead — thread-safe, verified equal to the emulator reader |
 | every process started with amnesia | `soul.json`: lives, last words, intentions, a dossier on everyone it has met |
 | no model key → no way to test the thinking loop | `python -m ghost.fakechat` runs the real tool dispatch against a scripted model |
+| the human and the ghost fought over the d-pad silently | the Runtime tracks the player's held keys; the ghost notices an unprompted move |
 
 ## Controls (window)
 
