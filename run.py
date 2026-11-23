@@ -581,12 +581,14 @@ def main():
     ap.add_argument("--no-ghost", action="store_true")
     ap.add_argument("--mute", action="store_true")
     ap.add_argument("--fresh", action="store_true",
-                    help="factory-reset the cartridge (undo every past hack) and archive the notebook: a new ghost")
+                    help="factory-reset the cartridge (undo every past hack) and archive the notebook: a new "
+                         "ghost. Resets and exits unless you also pass --go")
     ap.add_argument("--bored", action="store_true", help="wake the ghost already bored out of its mind (straight to hacking)")
     ap.add_argument("--frames", type=int, default=0, help="quit after N frames (testing)")
     ap.add_argument("--seek", action="store_true",
                     help="no LLM: the ghosts' traits still run (monologue, narration, autonomy) - watch it live")
     ap.add_argument("--selftest", action="store_true", help="run the live-cartridge self-tests and exit")
+    ap.add_argument("--go", action="store_true", help="with --fresh: reset, then immediately start the app")
     ap.add_argument("--soul", action="store_true",
                     help="print the ghost's soul file (lives, last words, intentions, who it has met) and exit")
     args = ap.parse_args()
@@ -622,6 +624,9 @@ def main():
         if NOTEBOOK.exists():
             NOTEBOOK.rename(NOTEBOOK.with_name(f"notebook-{time.strftime('%Y%m%d-%H%M%S')}.md"))
         print("fresh cartridge: original ROM restored, old notebook archived")
+        if not args.go:
+            print("done. start it again with:  .venv/bin/python run.py --seek   (or plain run.py with a model key)")
+            raise SystemExit(0)
     game = Game(args.state)
     world = World(game)
     rt = Runtime(game, world)

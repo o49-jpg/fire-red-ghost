@@ -1,8 +1,11 @@
 # --- things that must never be committed ---
-# copyrighted ROM dumps and the live, patched cartridge
-roms/*.gba
+# copyrighted ROM dumps and the live, patched cartridge.
+# ignore the DIRECTORIES, not just the extensions: `git add -A` happily re-added
+# roms/firered.gba and the live cartridge because those files were already tracked.
+roms/
 integrations/*/rom.gba
-integrations/*/*.state
+integrations/*/rom.sha
+integrations/*/type_chart_addr.txt
 *.gba
 *.sav
 

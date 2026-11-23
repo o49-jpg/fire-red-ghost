@@ -10,13 +10,21 @@ player's body swapped for any NPC's, the weather changed from inside the room.
 ![the ghost](sprites/ghost_banner.png)
 
 ```bash
-./setup.sh                  # python venv, deps, the decompilation, ROM checks
-.venv/bin/python -m ghost.selftest   # 20 live checks against a real emulator
+# 0. put your own dump at roms/firered.gba (see below) - setup refuses to run without it
+./setup.sh                  # venv, deps, decompilation, live cartridge, then 21 live self-tests
+./setup.sh --skip-tests     # same, without the emulator checks
+./setup.sh --check          # verify an existing install and run the tests; changes nothing
+
 .venv/bin/python run.py               # window + a model-driven ghost
 .venv/bin/python run.py --seek        # no LLM: watch it wander and narrate on instinct
 .venv/bin/python run.py --soul        # what it remembers from its previous lives
+.venv/bin/python run.py --fresh       # factory-reset the cartridge (resets, then exits; add --go to play)
 .venv/bin/python -m ghost.fakechat    # exercise the whole tool loop with a scripted model, no API key
 ```
+
+`setup.sh` is idempotent — a second run takes ~3 s and downloads nothing. A cold install is roughly
+**156 MB of wheels + 70 MB of source** (≈4 min on fast broadband, ≈15 min on a slow connection) and about
+**500 MB on disk**; the decompilation is only ever *read*, never compiled, so no ARM toolchain is needed.
 
 `OPENROUTER_API_KEY` (env or `~/.config/opencode/secrets.env`) makes it think. Without one, `--seek` still
 shows the creature moving, speaking through the textbox and changing the weather — the model only adds
@@ -109,7 +117,7 @@ life 2: [soul] THIS IS LIFE 2 ... previous life ended in PalletTown_PlayersHouse
 | `read_connections()` mis-parsed the connection struct | reads `u8 dir; u32 offset; u8 group; u8 num` |
 | tools waited forever on long walks | `NAV_TIMEOUT` + `nav_status`; timers no longer overwrite results |
 | the ghost could only teleport to move | `go_to` / `explore` / `phase_to` with real pathfinding |
-| no way to verify any of it | `python -m ghost.selftest` — 20 live checks |
+| no way to verify any of it | `python -m ghost.selftest` — 21 live checks |
 | `phase()` landed every warp at the room's old coordinates | writes `SaveBlock1->pos` itself (CB2_LoadMap never calls `SetPlayerCoordsFromWarp`); exact tiles, verified |
 | a warp struct packed as 7 bytes | `struct WarpData` is 8 (`warpId` at +2, pad, `s16 x,y` at +4/+6) |
 | `nav.landing_tile()` read the live emulator from a background thread | `map_grid_rom()` reads the ROM image instead — thread-safe, verified equal to the emulator reader |
@@ -138,5 +146,16 @@ ghost/selftest.py     live tests against a real ROM
 run.py                the window, the shared gamepad, the walker state machine, tool dispatch
 ```
 
-ROM, decompilation and the live patched cartridge are git-ignored: bring your own legally dumped
-FireRed (USA) v1.0, SHA1 `41cb23d8dccc8ebd7c649cd8fbb58eeace6e2fdc`.
+## The ROM
+
+This repository ships no game code — not the ROM, not the live patched cartridge. Both are git-ignored, and
+`setup.sh` checks for your copy **before** it downloads anything, because discovering that afterwards is a
+wasted 156 MB.
+
+Put a legally dumped **Pokémon FireRed (USA) v1.0** at `roms/firered.gba`, SHA1
+`41cb23d8dccc8ebd7c649cd8fbb58eeace6e2fdc`. Any other revision fails the check by design: the symbol map is
+built for that exact ROM, so a v1.1 or European dump would put every memory read on the wrong address.
+
+`setup.sh` copies your dump to `integrations/PokemonFireRed-Gba/rom.gba`, which is the copy the ghost is
+allowed to patch. Your original is never written to. `F12` in the window or `--fresh` on the command line
+restores it.
