@@ -1,0 +1,5 @@
+# FireRed Ghost runtime dependencies
+stable-retro>=0.9.2      # the GBA emulator core + PokemonFireRed integration
+numpy>=1.24             # frames, palettes, audio mixing
+pillow>=10.0            # grayscale vision, PNG sprites
+pygame>=2.5             # window, input, mixer  (headless use is fine: --no-ghost --mute)

@@ -41,15 +41,24 @@ class World:
         self.relocated_chart: int | None = (int(self.chart_file.read_text(), 16)
                                             if self.chart_file.exists() else None)
         self.persistent_palette: dict | None = None
+        self._names: dict[str, list[str]] = {}          # ROM name tables, cached until the ghost renames something
 
     # ---- names from ROM tables (so hacks show up here too) ----------------------------------------------------
     def _name_table(self, sym: str, width: int, count: int) -> list[str]:
-        base = self.g.sym(sym).addr
-        return [decode_text(self.g.rom_read(base + i * width, width)) for i in range(count)]
+        if sym not in self._names:
+            base = self.g.sym(sym).addr
+            self._names[sym] = [decode_text(self.g.rom_read(base + i * width, width)) for i in range(count)]
+        return self._names[sym]
+
+    def invalidate_names(self):
+        """Renames live in ROM name tables; drop the cache so lookups see them immediately."""
+        self._names.clear()
 
     def type_names(self): return self._name_table("gTypeNames", TYPE_NAME_LEN, N_TYPES)
-    def move_name(self, i): return decode_text(self.g.rom_read(self.g.sym("gMoveNames").addr + i * MOVE_NAME_LEN, MOVE_NAME_LEN))
-    def species_name(self, i): return decode_text(self.g.rom_read(self.g.sym("gSpeciesNames").addr + i * SPECIES_NAME_LEN, SPECIES_NAME_LEN))
+    def move_name(self, i): return self._name_table("gMoveNames", MOVE_NAME_LEN, N_MOVES)[i]
+    def species_name(self, i):
+        table = self._name_table("gSpeciesNames", SPECIES_NAME_LEN, 412)
+        return table[i] if 0 <= i < len(table) else f"SPECIES{i}"
 
     def resolve(self, kind: str, ref) -> int:
         """Name or number -> id, for 'type' | 'move' | 'species'."""
@@ -59,9 +68,9 @@ class World:
         if kind == "type":
             names = self.type_names()
         elif kind == "move":
-            names = [self.move_name(i) for i in range(N_MOVES)]
+            names = self._name_table("gMoveNames", MOVE_NAME_LEN, N_MOVES)
         else:
-            names = [self.species_name(i) for i in range(412)]
+            names = self._name_table("gSpeciesNames", SPECIES_NAME_LEN, 412)
         for i, n in enumerate(names):
             if n.upper().replace(" ", "") == want:
                 return i
@@ -129,6 +138,7 @@ class World:
         t = self.resolve("type", type_ref)
         old = self.type_names()[t]
         self.g.rom_patch(self.g.sym("gTypeNames").addr + t * TYPE_NAME_LEN, encode_text(name.upper()[:6], TYPE_NAME_LEN))
+        self.invalidate_names()
         return f"type {t} {old} -> {name.upper()[:6]}"
 
     def chart_addr(self) -> int:
@@ -205,6 +215,7 @@ class World:
         old = self.move_name(m)
         if name:
             self.g.rom_patch(self.g.sym("gMoveNames").addr + m * MOVE_NAME_LEN, encode_text(name.upper()[:12], MOVE_NAME_LEN))
+            self.invalidate_names()
             changes.append(f"renamed {name.upper()[:12]}")
         return f"move {m} {old}: " + ", ".join(changes)
 
@@ -226,6 +237,7 @@ class World:
         old = self.species_name(s)
         if name:
             self.g.rom_patch(self.g.sym("gSpeciesNames").addr + s * SPECIES_NAME_LEN, encode_text(name.upper()[:10], SPECIES_NAME_LEN))
+            self.invalidate_names()
             changes.append(f"renamed {name.upper()[:10]}")
         return f"species {s} {old}: " + ", ".join(changes)
 
@@ -299,18 +311,39 @@ class World:
         return self.g.sym("gObjectEventPal_Player").addr
 
     def _npc_sprite(self, name: str) -> tuple[bytes, bytes]:
-        """(pic 0x900 bytes, palette 32 bytes) of another 16x32 overworld character."""
+        """(pic 0x900 bytes, palette 32 bytes) of another 16x32 overworld character.
+
+        Sheets differ in length: Red has 9 frames, Mom only 3 (facing down/up/side). We read the sheet's
+        OWN frame table (sPicTable_<Name>) and repeat its frames up to 9, so a 3-frame NPC still animates
+        when worn as the player's body."""
         info = self.g.sym(f"gObjectEventGraphicsInfo_{name}").addr
         pal_tag = struct.unpack("<H", self.g.rom_read(info + 2, 2))[0]
         width, height = struct.unpack("<hh", self.g.rom_read(info + 8, 4))
         if (width, height) != (16, 32):
             raise ValueError(f"{name} is {width}x{height}; only 16x32 people fit your body")
         images = self.g.u32(info + 0x1C)
-        first = self.g.u32(images)                               # SpriteFrameImage[0].data
-        owner = next((s for s in self.g.syms.values() if s.addr == first and s.size), None)
-        if owner is None or owner.size < self.FRAME_BYTES * self.FRAMES:
-            raise ValueError(f"{name}'s sprite sheet isn't a standard 9-frame walker")
-        pic = self.g.rom_read(first, self.FRAME_BYTES * self.FRAMES)
+        owner = next((s for s in self.g.syms.values() if s.addr == images and s.size), None)
+        slots = min(16, owner.size // 8) if owner else 12
+        rom_last = ROM_BASE + len(self.g.rom)
+        frames = []
+        for i in range(slots):
+            if i >= slots:
+                break
+            try:
+                ptr, size = struct.unpack("<IH", self.g.rom_read(images + i * 8, 8))
+            except struct.error:
+                break
+            if not (ROM_BASE <= ptr < rom_last) or size != self.FRAME_BYTES:
+                break
+            frames.append(ptr)
+        if frames:
+            pic = b"".join(self.g.rom_read(p, self.FRAME_BYTES) for p in (frames * 9)[:9])
+            # walk-cycle slots follow each key frame; if the sheet has a full 9, prefer it verbatim
+            if len(frames) >= 9:
+                pic = b"".join(self.g.rom_read(p, self.FRAME_BYTES) for p in frames[:9])
+        else:                                    # no usable frame table: fall back to a raw sheet read
+            first = self.g.u32(images)
+            pic = self.g.rom_read(first, self.FRAME_BYTES * self.FRAMES)
         table = self.g.sym("sObjectEventSpritePalettes")
         for i in range(table.size // 8):
             ptr, tag = struct.unpack("<IH", self.g.rom_read(table.addr + i * 8, 6))

@@ -23,15 +23,18 @@ from concurrent.futures import Future
 import numpy as np
 import pygame
 
-from ghost import evil, fx, perception
+from ghost import evil, fx, nav, perception
 from ghost.agent import Agent
-from ghost.core import Game, decode_text, encode_text
+from ghost.core import ROOT, ORIGINAL_ROM, Game, decode_text, encode_text
+from ghost.script import ScriptEngine
 from ghost.world import World
 
 SCALE = 3
 PANEL_W = 420
 FPS = 60
 TILE_FRAMES = 16               # frames to walk one tile
+WARP_SETTLE = 90               # frames a door/stairs/connection may take to change the map
+WALK_FRAME_CAP = 2400          # a single walk() may not hold the emulator longer than this
 KEYS = {pygame.K_UP: "UP", pygame.K_DOWN: "DOWN", pygame.K_LEFT: "LEFT", pygame.K_RIGHT: "RIGHT",
         pygame.K_z: "A", pygame.K_x: "B", pygame.K_RETURN: "START", pygame.K_BACKSPACE: "SELECT",
         pygame.K_a: "L", pygame.K_s: "R"}
@@ -52,6 +55,14 @@ class Runtime:
         self.stop = threading.Event()
         self.say = lambda text: threading.Event()
         self.on_hack = lambda kind, label: None
+        self.script = ScriptEngine(game, world)           # the ghost's voice inside the game's textbox
+        self.walker: dict | None = None                   # stateful go_to()/explore()/phase_to() navigation
+        self.seen_maps: set[str] = set()                  # maps the ghost has walked on
+        self.seen_ids: set[str] = set()                   # "group.num" ids of those maps
+        self.atlas: list[dict] | None = None               # 820 warp targets, built lazily from the ROM
+        self.atlas_map: str | None = None
+        self.last_nav: dict = {}
+        self.last_map_key: tuple | None = None
 
     def stopping(self):
         return self.stop.is_set()
@@ -70,11 +81,236 @@ class Runtime:
         while not self.calls.empty():
             fn, fut = self.calls.get_nowait()
             try:
-                fut.set_result(fn())
+                result = fn()
             except Exception as ex:
                 fut.set_result(f"error: {type(ex).__name__}: {ex}")
+                continue
+            if isinstance(result, Future):
+                # go_to/explore/phase_to hand back the SAME future they resolve when the walk ends;
+                # if a tool wrapped it in another future, forward that one's eventual result
+                if fut is not result:
+                    result.add_done_callback(lambda done, outer=fut: outer.done() or outer.set_result(done.result()))
+                continue
+            fut.set_result(result)
+
+    # ---- navigation: go_to / explore / phase_to -----------------------------------------------------------
+    def _map_key(self):
+        grp, num, _name = self.w.location()
+        return grp, num
+
+    def _plan(self, goal) -> list[str] | None:
+        """A* path in player coords, treating every other person on the map as an obstacle."""
+        info = nav.read_map(self.g)
+        px, py = self.w.position()
+        people = {(o["x"] - nav.MAP_OFFSET, o["y"] - nav.MAP_OFFSET)
+                  for o in perception.object_events(self.g) if o["kind"] != "player"}
+        people.discard((px + 1, py))                   # can't stand still, but don't fear your own shadow
+        return nav.astar(info, (px, py), tuple(goal), blocked=people)
+
+    @staticmethod
+    def _dir(a: tuple[int, int], b: tuple[int, int]) -> str:
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        return {(0, -1): "UP", (0, 1): "DOWN", (-1, 0): "LEFT", (1, 0): "RIGHT"}.get((dx, dy), "UP")
+
+    @staticmethod
+    def _approach(info, tile: tuple[int, int]) -> tuple[int, int] | None:
+        """Where to stand so a single step lands on `tile` while holding its warp direction.
+
+        FireRed's stair warps only fire when the step COMPLETES while the direction is still held, so the
+        ghost has to approach from the side the stairs run (left stairs are climbed from the right)."""
+        warp_dir = info.warp_direction(*tile)
+        if warp_dir:
+            behind = {"UP": (0, 1), "DOWN": (0, -1), "LEFT": (1, 0), "RIGHT": (-1, 0)}[warp_dir]
+            candidate = (tile[0] + behind[0], tile[1] + behind[1])
+            if info.walkable(*candidate):
+                return candidate
+        options = [(tile[0] + dx, tile[1] + dy) for dx, dy in ((0, 1), (0, -1), (1, 0), (-1, 0))]
+        walkable = [o for o in options if info.walkable(*o)]
+        return min(walkable, key=lambda o: abs(o[0] - tile[0]) + abs(o[1] - tile[1])) if walkable else None
+
+    def nav_goal_start(self, kind: str, args: dict) -> dict:
+        """Start a walker. Returns its state dict; the walker is advanced by next_input() each frame."""
+        if self.walker is not None:
+            return {"error": "already walking somewhere"}
+        fut: Future = Future()
+        state = {"kind": kind, "future": fut, "frames": 0, "path": [], "idx": 0, "last": None,
+                 "stuck": 0, "replans": 0, "events": [], "settle": 0, "triggered": False,
+                 "start_map": self._map_key(), "map_name": self.w.location()[2],
+                 "start_pos": tuple(self.w.position()), "target": None, "error": None}
+        if kind == "go_to":
+            target = (int(args.get("x", 0)), int(args.get("y", 0)))
+            state["target"] = target
+            state["path"] = self._plan(target) or []
+            if not state["path"] and tuple(self.w.position()) != target:
+                state["walkable_probe"] = nav.read_map(self.g).walkable(*target)
+        elif kind == "explore":
+            info = nav.read_map(self.g)
+            warps = nav.read_warp_tiles(self.g)
+            # only warps the engine can actually fire: a warp tile needs a known behaviour AND a direction
+            # to hold. Mom's invisible doormats are scripted, not stepped on.
+            warps = {t: v for t, v in warps.items() if info.warp_direction(*t)}
+            self.last_exits = {t: info.warp_direction(*t) for t in warps}
+            conns = nav.read_connections(self.g)
+            size = (info.width, info.height)
+            exits = []
+            for tile, dest in warps.items():
+                exit_id = f"{dest[0]}.{dest[1]}"
+                exits.append({"tile": tile, "how": "warp", "dest": exit_id,
+                              "new": exit_id not in self.seen_ids})
+            edges = {"north": [(x, 0) for x in range(size[0])],
+                     "south": [(x, size[1] - 1) for x in range(size[0])],
+                     "west": [(0, y) for y in range(size[1])],
+                     "east": [(size[0] - 1, y) for y in range(size[1])]}
+            for direction, tiles in edges.items():
+                if direction not in conns:
+                    continue
+                grp, num, offset = conns[direction]
+                exit_id = f"{grp}.{num}"
+                for tile in tiles:
+                    if info.walkable(*tile):
+                        exits.append({"tile": tile, "how": "edge", "dest": exit_id,
+                                      "new": exit_id not in self.seen_ids})
+            scored = []
+            for e in exits:
+                path = self._plan(e["tile"])
+                if path is None:
+                    continue
+                if e["how"] == "warp":
+                    approach = self._approach(info, e["tile"])
+                    path = self._plan(approach) if approach else None
+                    if path is None:
+                        continue
+                    path = path + [self._dir(approach, e["tile"])]
+                scored.append(((0 if e["new"] else 1), len(path), e, path))
+            if scored:
+                scored.sort(key=lambda t: (t[0], t[1]))
+                _new, _len, e, path = scored[0]
+                state["path"], state["target"] = path, e["tile"]
+                state["expect_change"] = True
+                state["events"].append({"exit": e["how"], "to": e["dest"], "unseen": e["new"]})
+        elif kind == "phase_to":
+            ref = str(args.get("map", ""))
+            state["warp_to"] = ref
+            if args.get("x") is not None:
+                state["phase_xy"] = (int(args["x"]), int(args["y"]))
+        state["last"] = tuple(self.w.position())
+        self.walker = state
+        if state["error"]:
+            self._finish(state, state["error"])
+        return state
+
+    def _finish(self, state: dict, result: str):
+        try:
+            grp, num, name = self.w.location()
+            self.seen_maps.add(name)
+            self.seen_ids.add(f"{grp}.{num}")
+        except Exception:
+            pass
+        self.walker = None
+        state["future"].set_result(result)
+        self.last_nav = {"result": result, "events": state["events"][-12:]}
+
+    def _advance_walker(self) -> set:
+        """One frame of navigation. Returns the buttons to hold this frame."""
+        st = self.walker
+        st["frames"] += 1
+        if st["frames"] > WALK_FRAME_CAP:
+            self._finish(st, f"gave up after {WALK_FRAME_CAP} frames at {list(self.w.position())}")
+            return set()
+        if st["kind"] == "phase_to":
+            xy = st.get("phase_xy")
+            x, y = xy if xy else (0, 0)
+            out = evil.phase(self.w, st["warp_to"], x, y)
+            self.on_hack("ram", out)
+            self._finish(st, out)
+            return set()
+        pos = tuple(self.w.position())
+        map_now = self._map_key()
+        if map_now != st["start_map"]:
+            grp, num, name = self.w.location()
+            self._finish(st, f"left {st['map_name']} and arrived at {name} ({grp}.{num}) {list(pos)}")
+            return set()
+        if pos != st["last"]:
+            came_from = st["last"]
+            st["idx"] += 1
+            st["last"] = pos
+            st["stuck"] = 0
+            st["triggered"] = False
+            st["events"].append({"tile": list(pos)})
+            if pos in nav.read_warp_tiles(self.g):
+                # a warp tile was just stepped on: keep holding the entry direction for a few frames
+                st["landed_warp"] = (pos, came_from)
+            return set()
+        # --- nowhere new this frame ---
+        landed = st.pop("landed_warp", None)
+        if landed:
+            pos_w, from_w = landed
+            hold = self._dir(from_w, pos_w)
+            st["settle"] += 1
+            if st["settle"] <= 24:
+                return {hold}
+            st["settle"] = 0
+        target = st.get("target")
+        warps = nav.read_warp_tiles(self.g)
+        if st["idx"] >= len(st["path"]):
+            if target in warps and not st.get("triggered"):
+                # standing on the stairs/door: the engine needs a FRESH press in the tile's own direction
+                st["triggered"] = True
+                st["settle"] = 0
+                st["warp_dir"] = nav.read_map(self.g).warp_direction(*target) or "UP"
+                if st["kind"] in ("explore", "go_to"):
+                    return set()                       # let the walk finish, then press
+                st["path"] = []
+            if target in warps and st.get("triggered"):
+                st["path"] = [st.get("warp_dir", "UP")]
+                st["idx"] = 0
+                st["settle"] += 1
+                if st["settle"] == 1:
+                    return set()                       # one frame of stillness, then press
+                if st["settle"] > 40:
+                    if st["kind"] == "explore":
+                        if self._phase_via_atlas(st):
+                            return set()
+                    self._finish(st, f"stood on {list(pos)} holding {st.get('warp_dir')} and the engine "
+                                     f"never took me through")
+                return {st.get("warp_dir", "UP")}
+            if target is not None and pos == tuple(target):
+                self._finish(st, f"arrived at {list(pos)} on {self.w.location()[2]}")
+                return set()
+            st["settle"] += 1
+            if st["settle"] > WARP_SETTLE:
+                self._finish(st, f"stopped at {list(pos)} on {self.w.location()[2]}")
+            return set()
+        st["stuck"] += 1
+        if st["stuck"] in (14, 40, 90, 160):
+            path = self._plan(st["target"]) if st["target"] else None
+            st["replans"] += 1
+            st["events"].append({"replanned": st["replans"], "at": list(pos)})
+            if path is None:
+                self._finish(st, f"my way to {st['target']} is gone at {list(pos)}")
+                return set()
+            st["path"], st["idx"] = path, 0
+        return {st["path"][st["idx"]]} if st["idx"] < len(st["path"]) else set()
+
+    def _phase_via_atlas(self, st: dict) -> bool:
+        """Last resort for explore(): teleport through a warp the atlas knows, preferring somewhere unseen."""
+        info = self.w.location()
+        if self.atlas is None or self.atlas_map != info[2]:
+            self.atlas = nav.world_warps(self.w)
+            self.atlas_map = info[2]
+        options = [e for e in self.atlas if e["from"] == info[2] and not e["to"][0].isdigit()]
+        fresh = [e for e in options if e["to"] not in self.seen_maps and e["to_id"] not in self.seen_maps]
+        pick = fresh or options
+        if not pick:
+            return False
+        choice = pick[len(self.seen_maps) % len(pick)]
+        st.update(kind="phase_to", warp_to=choice["to"], phase_xy=None)
+        st["events"].append({"atlas": f"{choice['from']} -> {choice['to']}"})
+        return True
 
     def next_input(self) -> set:
+        if self.walker is not None:
+            return self._advance_walker()
         m = self.mover
         if m is not None:
             m["frames"] += 1
@@ -117,7 +353,8 @@ class Runtime:
         return fut
 
     def _checkpoint(self, label: str):
-        self.undo_stack.append((label, self.g.save_state(), bytes(self.g.rom)))
+        with self.g.lock:
+            self.undo_stack.append((label, self.g.save_state(), bytes(self.g.rom)))
 
     def _hack(self, label: str, fn, big=False):
         self._checkpoint(label)
@@ -169,6 +406,44 @@ class Runtime:
             return fut
         if name == "radar":
             return json.dumps(perception.radar(w, int(a.get("radius", 9))))
+        if name == "map":
+            info, warps = nav.read_map(g), nav.read_warp_tiles(g)
+            return json.dumps({"drawing": nav.describe(info, warps), "warps": {f"{k[0]},{k[1]}": v for k, v in warps.items()},
+                               "connections": nav.read_connections(g), "size": [info.width, info.height],
+                               "you": list(w.position()), "map": w.location()[2]})
+        if name == "go_to":
+            st = self.nav_goal_start("go_to", a)
+            return st["error"] or st["future"]
+        if name == "explore":
+            st = self.nav_goal_start("explore", a)
+            return st["error"] or st["future"]
+        if name == "phase_to":
+            st = self.nav_goal_start("phase_to", a)
+            return st["error"] or st["future"]
+        if name == "nav_status":
+            if self.walker is None:
+                return json.dumps({"walking": False, "last": self.last_nav, "at": list(w.position()),
+                                   "map": w.location()[2]})
+            st = self.walker
+            return json.dumps({"walking": True, "kind": st["kind"], "target": st["target"],
+                               "progress": f"{st['idx']}/{len(st['path'])}", "stuck_frames": st["stuck"],
+                               "replans": st["replans"], "at": list(w.position()), "map": w.location()[2],
+                               "recent": st["events"][-6:]})
+        if name == "textbox":
+            # say() writes a new script into free ROM, so it must hot-swap: main thread only, via _queue_rom_hack
+            return self._queue_rom_hack("speak through the game", lambda: self.script.say(
+                a.get("text", "..."), hold=bool(a.get("hold", False))))
+
+        if name == "ask":
+            # staging happens on the main thread; the answer arrives while the game waits for A
+            self.script.ask_stage(a.get("question", "..."))
+            self.on_hack("ram", "asked the player a question")
+            return json.dumps({"asked": a.get("question"),
+                               "answer": self.script.ask_answer(float(a.get("wait", 45)))})
+        if name == "weather":
+            return self._hack("weather", lambda: self.script.weather(a.get("weather", "thunderstorm")))
+        if name == "music":
+            return self._hack("music", lambda: self.script.music(int(a.get("song", 274))))
         if name == "advance_text":
             times = max(1, min(30, int(a.get("times", 3))))
             seq: list[set] = []
@@ -297,11 +572,23 @@ def main():
                     help="factory-reset the cartridge (undo every past hack) and archive the notebook: a new ghost")
     ap.add_argument("--bored", action="store_true", help="wake the ghost already bored out of its mind (straight to hacking)")
     ap.add_argument("--frames", type=int, default=0, help="quit after N frames (testing)")
+    ap.add_argument("--seek", action="store_true",
+                    help="no LLM: the ghosts' traits still run (monologue, narration, autonomy) - watch it live")
+    ap.add_argument("--selftest", action="store_true", help="run the live-cartridge self-tests and exit")
     args = ap.parse_args()
+
+    if args.selftest:
+        from ghost.selftest import main as selftest_main
+        raise SystemExit(selftest_main())
+    for path, what in ((ROOT / "disasm", "the pret/pokefirered decompilation"),
+                       (ORIGINAL_ROM, "the original cartridge dump")):
+        if not path.exists():
+            print(f"missing {what}: {path}\nrun ./setup.sh first (it fetches the decompilation and checks the ROM)")
+            raise SystemExit(2)
 
     if args.fresh:
         import shutil
-        from ghost.core import LIVE_ROM, ORIGINAL_ROM
+        from ghost.core import LIVE_ROM
         from ghost.agent import NOTEBOOK
         from ghost.world import game_chart_file
         shutil.copyfile(ORIGINAL_ROM, LIVE_ROM)
@@ -381,10 +668,16 @@ def main():
 
     rt.say, rt.on_hack = say, on_hack
     agent = None
-    if not args.no_ghost:
+    if args.seek or (not args.no_ghost):
         agent = Agent(rt, log)
         if args.bored:
             agent.meters.boredom, agent.meters.enjoyment = 95.0, 10.0
+        if args.seek:
+            agent.key = None
+            from ghost.seeker import Seeker
+            agent.seek = True
+            Seeker(agent, rt, log).attach()
+            log("SEEK MODE: no LLM - the ghost moves on instinct and speaks through the cartridge", "info")
         agent.start()
         if audio_ok:
             play(ch_sfx, fx.sfx_boot(rate))

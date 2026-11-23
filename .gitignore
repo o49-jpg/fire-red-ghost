@@ -1,0 +1,21 @@
+# --- things that must never be committed ---
+# copyrighted ROM dumps and the live, patched cartridge
+roms/*.gba
+integrations/*/rom.gba
+integrations/*/*.state
+*.gba
+*.sav
+
+# the decompilation: fetched by setup.sh, ~60 MB, not ours to vendor
+disasm/
+
+# python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# runtime scratch
+*.log
+/tmp/
+.DS_Store
