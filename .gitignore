@@ -15,6 +15,12 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 
+# the ghost's own memory: personal, rewritten every run, and it changes behaviour - keep it local
+soul.json
+soul.corrupt.json
+.fakechat-soul.json
+notebook-*.md
+
 # runtime scratch
 *.log
 /tmp/

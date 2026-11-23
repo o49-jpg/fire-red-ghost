@@ -224,6 +224,79 @@ def test_swap_safety(g, w, rt):
     assert w.type_names()[9] in ("VOID", "???"), w.type_names()[9]
 
 
+@check("the soul survives the death of the process")
+def test_soul(g, w, rt):
+    """Two Soul objects on one file model two runs: the second must know it is the second."""
+    import tempfile
+    from pathlib import Path
+    from .soul import Soul, mood_word
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "soul.json"
+        first = Soul(path)
+        assert "FIRST LIFE" in first.wake(), "a brand-new soul should say so"
+        assert "kept:" in first.intend("Test the boundaries of the map.")
+        second = Soul(path)                      # a new process, same file
+        note = second.wake()
+        assert "LIFE 2" in note, note
+        assert "Test the boundaries of the map." in note, "intentions must cross the boundary"
+        first.sleep(map="PalletTown", pos=(6, 6), mood="bored", last_words="I was here.",
+                    deeds={"npc_deleted": 3})
+        third = Soul(path)
+        note = third.wake()
+        assert "I was here." in note and "bored" in note, note
+        assert third.dossier_line("Mom") == "", "an unmet person must have no history"
+        third.meet("Mom", kind="npc_rewritten", map="PalletTown_PlayersHouse_1F")
+        line = third.dossier_line("Mom")
+        assert "rewritten by you" in line, line
+        assert mood_word(type("M", (), {"boredom": 90, "enjoyment": 50})()) .startswith("restless")
+        # a corrupted soul is not a crash: it is amnesia with the wreckage kept
+        path.write_text("{not json")
+        assert Soul(path).lifetimes == 0
+        assert path.with_suffix(".corrupt.json").exists()
+
+
+@check("phase() lands the player exactly where it was told to")
+def test_phase_coords(g, w, rt):
+    from . import evil
+    assert "PalletTown" in evil.phase(w, "PalletTown", 8, 5)
+    for _ in range(200):
+        g.step(set())
+    name = w.location()[2]
+    pos = tuple(w.position())
+    assert name == "PalletTown", f"landed on {name}"
+    assert pos == (8, 5), f"landed at {pos}, not (8,5)"
+    assert "PewterCity" in evil.phase(w, "PewterCity")       # no coords: a legal tile is picked for us
+    for _ in range(200):
+        g.step(set())
+    assert w.location()[2] == "PewterCity", w.location()[2]
+
+
+@check("seek mode's instinct can fulfil an intention its past life wrote")
+def test_intention(g, w, rt):
+    import tempfile
+    from pathlib import Path
+    from .soul import Soul
+    from .seeker import Seeker
+    from .agent import Agent
+
+    with tempfile.TemporaryDirectory() as tmp:
+        agent = Agent.__new__(Agent)                 # no network, no thread: just the parts seek needs
+        agent.soul = Soul(Path(tmp) / "soul.json")
+        agent.soul.wake()
+        agent.meters = type("M", (), {"evils": {}, "seen_maps": set(), "monologue": ""})()
+        agent.log = lambda *a, **k: None
+        spoke = []
+        seeker = Seeker(agent, rt, lambda *a, **k: None)
+        seeker._narrate = lambda line: spoke.append(line)
+        seeker._travel = lambda dest: spoke.append(f"travel {dest}") or True
+        agent.soul.intend("go to ViridianCity and watch the water")
+        assert seeker._chase_intentions() is True, "instinct should have taken the errand"
+        assert any("ViridianCity" in line for line in spoke), spoke
+        assert agent.soul.intentions() == [], "a fulfilled intention must not haunt the next life"
+        assert seeker._chase_intentions() is False
+
+
 @check("the warp atlas covers the whole world")
 def test_atlas(g, w, rt):
     from . import nav

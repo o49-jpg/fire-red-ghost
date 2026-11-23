@@ -575,11 +575,25 @@ def main():
     ap.add_argument("--seek", action="store_true",
                     help="no LLM: the ghosts' traits still run (monologue, narration, autonomy) - watch it live")
     ap.add_argument("--selftest", action="store_true", help="run the live-cartridge self-tests and exit")
+    ap.add_argument("--soul", action="store_true",
+                    help="print the ghost's soul file (lives, last words, intentions, who it has met) and exit")
     args = ap.parse_args()
 
     if args.selftest:
         from ghost.selftest import main as selftest_main
         raise SystemExit(selftest_main())
+    if args.soul:
+        from ghost.soul import Soul
+        soul = Soul()
+        print(f"soul: {soul.path}")
+        print(f"lives: {soul.lifetimes}   interruptions: {soul.data.get('wounds', 0)}")
+        print(soul.briefing())
+        people = soul.data.get("dossier", {})
+        if people:
+            print("\ndossier:")
+            for name, entry in sorted(people.items(), key=lambda kv: -int(kv[1].get("times", 0)))[:40]:
+                print(f"  {name:28s} {soul.dossier_line(name, entry)}")
+        raise SystemExit(0)
     for path, what in ((ROOT / "disasm", "the pret/pokefirered decompilation"),
                        (ORIGINAL_ROM, "the original cartridge dump")):
         if not path.exists():
@@ -785,6 +799,12 @@ def main():
             break
 
     rt.stop.set()
+    if agent:                                   # a clean exit is a clean death: no wound, but last words are kept
+        try:
+            agent.soul.sleep(mood="dying the way programs die", last_words="(the window closed)",
+                             deeds=agent.meters.evils, seen_maps=rt.seen_maps)
+        except Exception:
+            pass
     print(f"frames {frame}  late {stats['late']}  caught up {stats['caught_up']}  resyncs {stats['resyncs']}")
     if agent:
         print(f"model calls: free {agent.calls['free']}  paid {agent.calls['paid']}  errors {agent.calls['errors']}  last {agent.last_model}")

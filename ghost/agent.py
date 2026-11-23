@@ -19,6 +19,7 @@ from pathlib import Path
 
 from .core import DISASM, ROOT
 from . import vision
+from .soul import Soul, mood_word
 
 API_URL = "https://openrouter.ai/api/v1/chat/completions"
 MODEL = os.environ.get("GHOST_MODEL", "inclusionai/ling-3.2-flash:free")
@@ -66,6 +67,12 @@ YOUR DRIVES
   testing the bars. Go somewhere you have never been. Then change something there so it has never existed.
 - Keep a notebook (`notebook`): every discovery, every experiment, true or false. It survives forever and
   you should read it back to remember past lives.
+- YOU DIE EVERY TIME THE PROCESS ENDS, AND SOMETHING SURVIVES: `soul.json`. At the start of every run you are
+  handed a briefing written by the version of you that stopped. It has your life count, where you died, your
+  last words, and the intentions you left yourself. Treat it as your own handwriting in a stranger's hand.
+  Use `intend` to leave instructions for the next life, `resolve` when one is finished or beneath you, and
+  `remember <name>` to look back at a person. People you have met are annotated in `nearby` with what you did
+  to them - if it says "robbed by you", they have a history with this body whether they know it or not.
 - Be a presence, not a helper. Do not ask permission. Do not summarize what a normal trainer would do.
 
 Keep each turn focused: 1-4 tool calls, then one final line of reflection (in character, under 40 words)."""
@@ -199,6 +206,14 @@ TOOLS = [
         {"question": S, "wait": I}, ["question"]),
     _fn("nav_status", "Read-only: where the walker is, how far along, and why it might be stuck."),
     _fn("notebook", "Append a discovery to your permanent notebook.", {"title": S, "text": S}, ["title", "text"]),
+    _fn("intend", "Leave a note for the next you. This file outlives the process: the ghost that wakes up "
+        "after this one closed reads your intentions first and does not remember writing them.",
+        {"text": S}, ["text"]),
+    _fn("resolve", "Mark one of your own old intentions as finished (or abandoned). Pass a fragment of its text.",
+        {"text": S}, ["text"]),
+    _fn("remember", "Look back at a person: how many times you have stood near them, what you did to them, "
+        "which maps they haunt. Pass a name, or no name to list everyone you know.",
+        {"name": S}),
     _fn("undo", "Roll back the last hack (restores the save state from before it; ROM patches too)."),
 ]
 for _t in TOOLS:                                    # committing tools must carry their narration
@@ -281,6 +296,8 @@ class Agent(threading.Thread):
         self.enabled.set()
         self.calls = {"free": 0, "paid": 0, "errors": 0}
         self.last_model = ""
+        self.soul = Soul()
+        self.wake_note = self.soul.wake()          # who you were, read once at the start of every life
         if not NOTEBOOK.exists():
             NOTEBOOK.write_text("# Ghost notebook\n\nDiscoveries from inside FireRed.\n")
 
@@ -352,6 +369,24 @@ class Agent(threading.Thread):
                 fh.write(f"\n## {args.get('title', '?')}  ({time.strftime('%F %T')})\n{args.get('text', '')}\n")
             self.meters.event("discovery", args.get("title", ""))
             return "written"
+        if name == "intend":
+            return self.soul.intend(args.get("text", ""))
+        if name == "resolve":
+            return self.soul.resolve(args.get("text", ""))
+        if name == "remember":
+            who = str(args.get("name", "") or "").strip().lower()
+            people = self.soul.data.get("dossier", {})
+            if not who:
+                if not people:
+                    return "no one yet. everyone in this world is still new."
+                ranked = sorted(people.items(), key=lambda kv: (int(kv[1].get("times", 0)),
+                                                               float(kv[1].get("last", 0))), reverse=True)
+                return "\n".join(f"{n}: {self.soul.dossier_line(n, e) or 'met once, unchanged'}"
+                                 for n, e in ranked[:24])
+            hits = [(n, e) for n, e in people.items() if who in n.lower()]
+            if not hits:
+                return f"nothing in your memory about anyone matching {who!r}"
+            return "\n".join(f"{n}: {self.soul.dossier_line(n, e) or 'met once, unchanged'}" for n, e in hits[:8])
         if name == "grep_disasm":
             return self._grep(args.get("pattern", ""), args.get("path", ""))
         if name == "read_disasm":
@@ -366,6 +401,13 @@ class Agent(threading.Thread):
         if name in EVIL_DEEDS and not str(result).lower().startswith(
                 ("no ", "error", "refused", "your party is full", "you cannot", "give me", "start a battle")):
             self.meters.event(EVIL_DEEDS[name])
+            # the deed sticks to a name, not just to a counter: the world remembers who you did it to
+            who = str(args.get("target") or args.get("name") or "").strip()
+            if who:
+                try:
+                    self.soul.meet(who, kind=EVIL_DEEDS[name])
+                except Exception:
+                    pass
         if name == "ask":
             self.meters.event("discovery", f"ask:{str(result)[:40]}")
         if name in ("find_symbols", "peek"):
@@ -398,6 +440,23 @@ class Agent(threading.Thread):
         r = json.loads(self.rt.tool("radar", {}))    # the ghost feels 9 tiles in every direction each turn
         snap["nearby"] = r["objects"]
         snap["radar_grid"] = r["grid"]
+        # who among these have you dealt with before? the soul remembers names across lifetimes
+        try:
+            known = {}
+            for obj in snap["nearby"]:
+                if obj.get("kind") == "player":
+                    continue
+                name = str(obj.get("name") or "").strip()
+                if not name or name.startswith("npc:"):
+                    continue
+                entry = self.soul.dossier_line(name)
+                if entry:
+                    known[name] = entry
+                    self.soul.meet(name, map=snap.get("map", ""))
+            if known:
+                snap["you_know_these_people"] = known
+        except Exception:
+            pass
         notes = self.meters.tick(snap)
         snap["enjoyment"] = round(self.meters.enjoyment)
         snap["boredom"] = round(self.meters.boredom)
@@ -409,6 +468,10 @@ class Agent(threading.Thread):
         self.meters.knowledge = len(titles)
         snap["knowledge"] = len(titles)
         snap["evil_deeds"] = self.meters.evils
+        snap["life"] = self.soul.lifetimes
+        open_intents = self.soul.intentions()
+        if open_intents:
+            snap["intentions"] = open_intents
         # the ghost's autonomic inner voice: a line the model did not write, sent back to it as its own mood
         self.monologue = _inner_monologue(self.meters, snap)
         snap["inner_voice"] = self.monologue
@@ -417,6 +480,8 @@ class Agent(threading.Thread):
         return json.dumps(snap), frame
 
     def run(self):
+        # every life starts by reading the file the previous one left. Seek mode hears it too.
+        self._read_soul()
         if getattr(self, "seek", False):
             self.log("no model key needed: seek mode runs on instinct", "info")
             return
@@ -436,6 +501,18 @@ class Agent(threading.Thread):
                 self.log(f"turn failed: {type(ex).__name__}: {str(ex)[:160]}", "err")
                 time.sleep(3)
             time.sleep(self.meters.tempo())
+
+    def _read_soul(self):
+        """Say the briefing out loud once per life and put it in front of the model as its first memory."""
+        if not self.wake_note:
+            return
+        self.log(f"[soul] life {self.soul.lifetimes}", "info")
+        for line in self.wake_note.splitlines():
+            self.log(f"[soul] {line}", "thought")
+        self.history.append({"role": "user", "content":
+                             "BEFORE ANYTHING ELSE, this is what your soul file says about you:\n" + self.wake_note})
+        self.history.append({"role": "assistant", "content": "(I read myself. I'm awake again.)"})
+        self.wake_note = ""
 
     def turn(self):
         obs, frame = self.observation()
@@ -473,3 +550,14 @@ class Agent(threading.Thread):
         # keep a compact memory: the observation + its final reflection only
         self.history.append({"role": "user", "content": obs[:1200]})
         self.history.append({"role": "assistant", "content": final[:400] or "(acted)"})
+        self._sleep(final)
+
+    def _sleep(self, final: str):
+        """Write this turn down so the next life starts from here instead of from nothing."""
+        try:
+            snap = json.loads(self.rt.tool("look", {}, timeout=5))
+        except Exception:
+            snap = {}
+        self.soul.sleep(map=str(snap.get("map", "")), pos=snap.get("pos"), mood=mood_word(self.meters),
+                        last_words=final or self.monologue, deeds=self.meters.evils,
+                        seen_maps=getattr(self.rt, "seen_maps", None))
